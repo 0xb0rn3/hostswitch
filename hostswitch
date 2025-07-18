@@ -1,0 +1,215 @@
+#!/bin/bash
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+print_message() {
+    local color=$1
+    local message=$2
+    echo -e "${color}${message}${NC}"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_message "$RED" "Error: This script must be run as root (use sudo)."
+        exit 1
+    fi
+}
+
+print_current_hostname() {
+    local current_hostname
+    current_hostname=$(hostname)
+    print_message "$GREEN" "Current hostname: $current_hostname"
+    
+    local fqdn
+    fqdn=$(hostname -f 2>/dev/null || echo "N/A")
+    if [[ "$fqdn" != "$current_hostname" && "$fqdn" != "N/A" ]]; then
+        print_message "$GREEN" "Current FQDN: $fqdn"
+    fi
+}
+
+validate_hostname() {
+    local hostname=$1
+    
+    if [[ ${#hostname} -gt 63 ]]; then
+        print_message "$RED" "Error: Hostname too long (max 63 characters)."
+        return 1
+    fi
+    
+    if [[ -z "$hostname" ]]; then
+        print_message "$RED" "Error: Hostname cannot be empty."
+        return 1
+    fi
+    
+    if [[ ! "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+        print_message "$RED" "Error: Invalid hostname format."
+        print_message "$YELLOW" "Hostname must:"
+        print_message "$YELLOW" "- Start and end with alphanumeric characters"
+        print_message "$YELLOW" "- Contain only letters, numbers, and hyphens"
+        print_message "$YELLOW" "- Not start or end with a hyphen"
+        return 1
+    fi
+    
+    return 0
+}
+
+backup_configs() {
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    print_message "$YELLOW" "Creating backup of configuration files..."
+    
+    if [[ -f /etc/hostname ]]; then
+        cp /etc/hostname "/etc/hostname.backup_$timestamp" || {
+            print_message "$RED" "Error: Failed to backup /etc/hostname"
+            return 1
+        }
+    fi
+    
+    if [[ -f /etc/hosts ]]; then
+        cp /etc/hosts "/etc/hosts.backup_$timestamp" || {
+            print_message "$RED" "Error: Failed to backup /etc/hosts"
+            return 1
+        }
+    fi
+    
+    print_message "$GREEN" "Backup created with timestamp: $timestamp"
+    return 0
+}
+
+update_hosts_file() {
+    local new_hostname=$1
+    local old_hostname
+    old_hostname=$(hostname)
+    
+    if [[ -f /etc/hosts ]]; then
+        if grep -q "^127\.0\.1\.1" /etc/hosts; then
+            sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$new_hostname/" /etc/hosts
+        else
+            echo -e "127.0.1.1\t$new_hostname" >> /etc/hosts
+        fi
+        
+        if [[ "$old_hostname" != "$new_hostname" ]]; then
+            sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/hosts
+        fi
+    else
+        print_message "$YELLOW" "Warning: /etc/hosts not found, creating minimal version..."
+        cat > /etc/hosts << EOF
+127.0.0.1	localhost
+127.0.1.1	$new_hostname
+::1		localhost ip6-localhost ip6-loopback
+ff02::1		ip6-allnodes
+ff02::2		ip6-allrouters
+EOF
+    fi
+}
+
+change_hostname() {
+    local new_hostname
+    
+    while true; do
+        read -p "Enter new hostname: " new_hostname
+        
+        if validate_hostname "$new_hostname"; then
+            break
+        fi
+        echo
+    done
+    
+    if [[ "$new_hostname" == "$(hostname)" ]]; then
+        print_message "$YELLOW" "Hostname is already set to '$new_hostname'. No changes needed."
+        return 0
+    fi
+    
+    echo
+    read -p "Are you sure you want to change hostname to '$new_hostname'? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_message "$YELLOW" "Hostname change cancelled."
+        return 0
+    fi
+    
+    print_message "$YELLOW" "Changing hostname to '$new_hostname'..."
+    
+    if ! backup_configs; then
+        print_message "$RED" "Failed to create backups. Aborting."
+        exit 1
+    fi
+    
+    if ! echo "$new_hostname" > /etc/hostname; then
+        print_message "$RED" "Error: Failed to update /etc/hostname"
+        exit 1
+    fi
+    
+    if ! update_hosts_file "$new_hostname"; then
+        print_message "$RED" "Error: Failed to update /etc/hosts"
+        exit 1
+    fi
+    
+    if command -v hostnamectl >/dev/null 2>&1; then
+        if ! hostnamectl set-hostname "$new_hostname"; then
+            print_message "$RED" "Error: Failed to set hostname using hostnamectl"
+            exit 1
+        fi
+    else
+        if ! hostname "$new_hostname"; then
+            print_message "$RED" "Error: Failed to set hostname"
+            exit 1
+        fi
+    fi
+    
+    print_message "$GREEN" "Hostname updated successfully!"
+    print_message "$YELLOW" "Note: You may need to restart your shell or reboot for all changes to take effect."
+}
+
+show_usage() {
+    echo "hostswitch v0.0.1 - System hostname changer"
+    echo "Author: 0xb0rn3 | 0xbv1"
+    echo "Repository: https://github.com/0xb0rn3/hostswitch"
+    echo
+    echo "Usage: $0 [OPTIONS]"
+    echo "Options:"
+    echo "  -h, --help     Show this help message"
+    echo "  -c, --current  Show current hostname only"
+    echo "  -v, --version  Show version information"
+    echo
+    echo "This script changes the system hostname and updates relevant configuration files."
+    echo "Root privileges are required."
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -c|--current)
+            print_current_hostname
+            exit 0
+            ;;
+        -v|--version)
+            echo "hostswitch v0.0.1"
+            echo "Author: 0xb0rn3 | 0xbv1"
+            exit 0
+            ;;
+        "")
+            ;;
+        *)
+            print_message "$RED" "Unknown option: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+    
+    check_root
+    
+    print_current_hostname
+    echo
+    
+    change_hostname
+}
+
+main "$@"
